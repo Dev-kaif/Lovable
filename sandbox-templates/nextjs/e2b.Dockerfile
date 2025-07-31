@@ -15,5 +15,7 @@ RUN npx --yes create-next-app@15.4.2 . --yes
 RUN npx --yes shadcn@2.9.3 init --yes -b neutral --force
 RUN npx --yes shadcn@2.9.3 add --all --yes
 
+RUN npm install lucide-react framer-motion
+
 # Move the Nextjs app to the home directory and remove the nextjs-app directory
 RUN mv /home/user/nextjs-app/* /home/user/ && rm -rf /home/user/nextjs-app
