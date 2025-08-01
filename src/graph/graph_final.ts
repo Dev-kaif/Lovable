@@ -6,7 +6,6 @@ import { StateGraph, START, END } from "@langchain/langgraph";
 import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
 
 // Logging Utility
-
 const logStep = (id: string, details?: string) => {
   console.log(`\n===== [STEP] ${id} =====`);
   if (details) console.log(details);
@@ -15,12 +14,13 @@ const logStep = (id: string, details?: string) => {
 
 const logState = (label: string, state: GraphState) => {
   console.log(`\n🔍 [${label}] - Current Graph State:`);
-  console.log(JSON.stringify(state, null, 2));
+  console.log(`Messages count: ${state.messages.length}`);
+  console.log(`Main task executed: ${state.mainTaskExecuted}`);
+  console.log(`Next: ${state.next}`);
   console.log("=====================================\n");
 };
 
 // Tool: RunInTerminal
-
 const RunInTerminal = makeToolClass(
   "runInTerminal",
   "Uses the terminal to run commands",
@@ -56,7 +56,6 @@ const RunInTerminal = makeToolClass(
 );
 
 // Tool: CreateOrUpdateFiles
-
 const CreateOrUpdateFiles = makeToolClass(
   "createOrUpdateFiles",
   "Creates or updates files in the Sandbox.",
@@ -93,8 +92,10 @@ const CreateOrUpdateFiles = makeToolClass(
         ...Object.fromEntries(toWrite.map((f) => [f.path, f.content])),
       };
 
-      state.network.data.writtenFiles = updatedWritten;
-      state.mainTaskExecuted = true;
+      // Update the network data - this will be persisted in the graph state
+      if (network?.data) {
+        network.data.writtenFiles = updatedWritten;
+      }
 
       console.log("✅ Files written. Updated writtenFiles:", updatedWritten);
       return `✅ Wrote ${toWrite.length} file(s): ${toWrite
@@ -107,7 +108,6 @@ const CreateOrUpdateFiles = makeToolClass(
 );
 
 // Tool: ReadFiles
-
 const ReadFiles = makeToolClass(
   "readFiles",
   "Reads the content of specified files in the Sandbox.",
@@ -123,10 +123,12 @@ const ReadFiles = makeToolClass(
         Promise.all(files.map((file) => state.sandbox.files.read(file)))
       );
 
-      return contents.map((content: any, i: any) => ({
-        path: files[i],
-        content,
-      }));
+      return JSON.stringify(
+        contents.map((content: any, i: any) => ({
+          path: files[i],
+          content,
+        }))
+      );
     } catch (e: any) {
       return `❌ Error reading files: ${e.message}`;
     }
@@ -134,7 +136,6 @@ const ReadFiles = makeToolClass(
 );
 
 // Tool Map Factory
-
 const createToolMap = (state: GraphState) => ({
   runInTerminal: new RunInTerminal(state),
   createOrUpdateFiles: new CreateOrUpdateFiles(state),
@@ -142,57 +143,65 @@ const createToolMap = (state: GraphState) => ({
 });
 
 // Tool Execution Node
-
 const callTools = async (state: GraphState): Promise<Partial<GraphState>> => {
   logState("TOOL NODE (before)", state);
   const lastMessage = state.messages.at(-1) as AIMessage;
   if (!lastMessage?.tool_calls?.length) {
-    return { messages: [] };
+    console.log("⚠️ No tool calls found in last message");
+    return {};
   }
 
   const toolMap = createToolMap(state);
   const toolMessages: ToolMessage[] = [];
 
-  // This is correct: use a local variable to track the flag's state for this turn.
-  let mainTaskWasExecuted = state.mainTaskExecuted;
+  // Track if main task was executed in this turn
+  let mainTaskExecuted = state.mainTaskExecuted;
+
+  console.log(`🔧 Processing ${lastMessage.tool_calls.length} tool calls`);
 
   for (const toolCall of lastMessage.tool_calls) {
-    console.log(`🔧 Invoking tool: ${toolCall.name}`);
+    console.log(`🔧 Invoking tool: ${toolCall.name} with ID: ${toolCall.id}`);
+
+    // Set flag if createOrUpdateFiles is called
     if (toolCall.name === "createOrUpdateFiles") {
-      mainTaskWasExecuted = true;
+      console.log("✅ Setting mainTaskExecuted to true");
+      mainTaskExecuted = true;
     }
 
     const tool = toolMap[toolCall.name as keyof typeof toolMap];
     let output: any = `❌ Tool "${toolCall.name}" not found.`;
+
     if (tool) {
       try {
+        console.log(`🔧 Executing tool: ${toolCall.name}`);
         output = await tool.invoke(toolCall.args);
+        console.log(`✅ Tool ${toolCall.name} completed successfully`);
       } catch (e: any) {
+        console.error(`❌ Tool ${toolCall.name} failed:`, e);
         output = `❌ Error running tool ${toolCall.name}: ${e.message}`;
       }
     }
+
     toolMessages.push(
       new ToolMessage({
-        content: output,
+        content: typeof output === "string" ? output : JSON.stringify(output),
         tool_call_id: toolCall.id!,
         name: toolCall.name,
       })
     );
   }
 
-  const newState: GraphState = {
-    ...state,
-    messages: [...state.messages, ...toolMessages], // Append new messages
-    mainTaskExecuted: mainTaskWasExecuted, // Set the new flag value
+  console.log(`✅ Completed ${toolMessages.length} tool executions`);
+  logState("TOOL NODE (after)", state);
+
+  // Return the updates to be merged with the state
+  return {
+    messages: toolMessages, // This will be concatenated by the reducer
+    mainTaskExecuted: mainTaskExecuted,
   };
-
-  // logState("TOOL NODE (after)", newState);
-
-  return newState;
 };
 
 // LLM Node
-
 const promptFinalSummary = async (messages: any[], llm: any) => {
   const prompt = new HumanMessage(
     "The files have been written successfully. Your task is complete. Please provide the final <task_summary> now."
@@ -204,36 +213,40 @@ const callLlm =
   (llm: any, llmWithTools: any) =>
   async (state: GraphState): Promise<Partial<GraphState>> => {
     logState("LLM NODE (before)", state);
-    
+
+    // Check if main task was executed and prompt for summary
     if (state.mainTaskExecuted) {
       console.log("✅ Main task executed. Prompting for final summary.");
       const response = await promptFinalSummary(state.messages, llm);
-      return { messages: [response], next: END };
+      return {
+        messages: [response],
+        next: END,
+      };
     }
 
+    // Normal LLM invocation
     const response: AIMessage = await llmWithTools.invoke(state.messages);
 
+    // Check for task summary in response
     const hasSummary =
       typeof response.content === "string" &&
       response.content.includes("<task_summary>");
-      const next = hasSummary
+
+    const next = hasSummary
       ? (console.log("✅ Summary detected."), END)
       : response.tool_calls?.length
       ? "tools"
       : (console.log("🛑 No tool calls or summary. Ending."), END);
-      
-      const newState: GraphState = {
-        ...state,
-      messages: [...state.messages, response],
+
+    logState("LLM NODE (after)", state);
+
+    return {
+      messages: [response], // This will be concatenated by the reducer
       next: next,
     };
-    
-    logState("LLM NODE (after)", state);
-    return newState;
   };
 
 // Graph Compiler
-
 export function buildGraph(llm: any) {
   const tools = [
     new RunInTerminal({} as any),
@@ -250,8 +263,7 @@ export function buildGraph(llm: any) {
     .addConditionalEdges(
       "agent",
       (state) => {
-        console.log("from condotional node ==> ", state.next);
-
+        console.log("🔄 Conditional edge - next:", state.next);
         return state.next!;
       },
       {
@@ -261,5 +273,5 @@ export function buildGraph(llm: any) {
     )
     .addEdge("tools", "agent");
 
-  return graph.compile();
+  return graph; // Return uncompiled graph
 }

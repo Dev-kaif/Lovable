@@ -7,15 +7,25 @@ export const appRouter = createTRPCRouter({
     .input(
       z.object({
         query: z.string(),
+        sessionId: z.string().optional(), // Add optional session ID
+        threadId: z.string().optional(),  // Add optional thread ID
       })
     )
     .mutation(async ({ input }) => {
-      inngest.send({
+      // Generate a session ID if not provided
+      const sessionId = input.sessionId || `session-${Date.now()}`;
+      const threadId = input.threadId || `thread-user-${sessionId}`;
+      
+      await inngest.send({
         name: "aiAgent",
         data: {
           query: input.query,
+          sessionId: sessionId,
+          threadId: threadId,
         },
       });
+      
+      return { sessionId, threadId };
     }),
   hello_3: baseProcedure
     .input(
