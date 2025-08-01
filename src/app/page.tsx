@@ -20,7 +20,7 @@ export default function Page() {
     <div className="bg-neutral-500 min-h-screen w-full text-white">
       <Button
         variant={"default"}
-        onClick={() => invoke.mutate({ query: "make a saas like Landing page for a store of buscits with framer motion" })}
+        onClick={() => invoke.mutate({ query: "write hello world on home page" })}
       >
         Invoke
       </Button>

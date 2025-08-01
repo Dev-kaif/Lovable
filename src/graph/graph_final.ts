@@ -5,184 +5,170 @@ import { GraphAnnotation, GraphState } from "@/lib/type";
 import { StateGraph, START, END } from "@langchain/langgraph";
 import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
 
-// --- TOOL DEFINITIONS ---
+// Logging Utility
 
-// const RunInTerminal = makeToolClass(
-//   "runInTerminal",
-//   "Uses the terminal to run commands",
-//   z.object({ command: z.string() }),
-//   async ({ command }, state) => {
-//     const uniqueStepId = `terminal-${command
-//       .replace(/[^a-zA-Z0-9]/g, "_")
-//       .slice(0, 30)}-${Date.now()}`;
-//     console.log(`\n===== Executing: ${uniqueStepId} =====\n`);
+const logStep = (id: string, details?: string) => {
+  console.log(`\n===== [STEP] ${id} =====`);
+  if (details) console.log(details);
+  console.log("================================\n");
+};
 
-//     const result: string = await state.step?.run(uniqueStepId, async () => {
-//       const buffer = { stdout: "", stderr: "" };
-//       try {
-//         const result = await state.sandbox.commands.run(command, {
-//           onStdout: (data: string) => {
-//             buffer.stdout += data;
-//           },
-//           onStderr: (data: string) => {
-//             buffer.stderr += data;
-//           },
-//         });
-//         return result.stdout;
-//       } catch (error) {
-//         const errorMessage = `Command failed: ${error}\nstdout: ${buffer.stdout}\nstderr: ${buffer.stderr}`;
-//         console.log(errorMessage);
-//         return errorMessage;
-//       }
-//     });
+const logState = (label: string, state: GraphState) => {
+  console.log(`\n🔍 [${label}] - Current Graph State:`);
+  console.log(JSON.stringify(state, null, 2));
+  console.log("=====================================\n");
+};
 
-//     return result;
-//   }
-// );
+// Tool: RunInTerminal
 
 const RunInTerminal = makeToolClass(
   "runInTerminal",
   "Uses the terminal to run commands",
   z.object({ command: z.string() }),
   async ({ command }, state) => {
-    const uniqueStepId = `terminal-${command.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 30)}-${Date.now()}`;
-    console.log(`\n===== Executing: ${uniqueStepId} =====\n`);
-    
+    const id = `terminal-${command
+      .replace(/[^a-zA-Z0-9]/g, "_")
+      .slice(0, 30)}-${Date.now()}`;
+    logStep(id, `Executing command: ${command}`);
     const { step, sandbox } = state;
 
     try {
-      // 1. Run the initial command
-      await step.run(uniqueStepId, () => sandbox.commands.run(command));
+      await step.run(id, () => sandbox.commands.run(command));
 
-      // 2. If it was an install command, verify it to get a clear signal
-      if (command.startsWith("npm install")) {
-        const packageName = command.split(" ")[2].split('@')[0]; // Extracts the package name
-        
+      const installMatch = command.match(/^npm install\s+(@?[\w-]+)/);
+      if (installMatch) {
+        const packageName = installMatch[1];
         const verifyStepId = `verify-install-${Date.now()}`;
-        const packageJsonContent = await step.run(verifyStepId, () => 
+        const packageJson = await step.run(verifyStepId, () =>
           sandbox.files.read("package.json")
         );
 
-        if (packageJsonContent.includes(`"${packageName}"`)) {
-          // 3. Return a simple, definitive success string
-          return `Successfully installed ${packageName}. package.json has been updated.`;
-        } else {
-          return `Error: Ran "npm install ${packageName}" but it did not appear in package.json.`;
-        }
+        return packageJson.includes(`"${packageName}"`)
+          ? `✅ Installed ${packageName}. Verified in package.json.`
+          : `❌ Installed ${packageName}, but it's missing from package.json.`;
       }
 
-      // For other commands, return a simple success message
-      return `Command "${command}" executed successfully.`;
-
+      return `✅ Command "${command}" executed successfully.`;
     } catch (e: any) {
-      return e.stderr || `Command failed: ${e.message}`;
+      return e.stderr || `❌ Command failed: ${e.message}`;
     }
   }
 );
 
+// Tool: CreateOrUpdateFiles
+
 const CreateOrUpdateFiles = makeToolClass(
   "createOrUpdateFiles",
-  "Creates or Updates files in the Sandbox.",
+  "Creates or updates files in the Sandbox.",
   z.object({
     files: z.array(z.object({ path: z.string(), content: z.string() })),
   }),
   async ({ files }, state) => {
-    const filePaths = files.map((f) => f.path).join(", ");
-    const uniqueWriteId = `write-${files[0].path
-      .replace(/[^a-zA-Z0-9]/g, "_")
-      .slice(0, 30)}-${Date.now()}`;
-    console.log(
-      `\n===== Executing: ${uniqueWriteId} for files: ${filePaths} =====\n`
+    const { step, sandbox, network } = state;
+    const writtenFiles = network?.data?.writtenFiles ?? {};
+    console.log("📂 Current writtenFiles before write:", writtenFiles);
+
+    const toWrite = files.filter(
+      (file) => writtenFiles[file.path] !== file.content
     );
 
-    const { step } = state;
+    if (toWrite.length === 0) {
+      return `⚠️ All requested files were already up-to-date. No write needed.`;
+    }
+
+    const id = `write-${toWrite[0].path
+      .replace(/[^a-zA-Z0-9]/g, "_")
+      .slice(0, 30)}-${Date.now()}`;
+    logStep(id, `Writing files: ${toWrite.map((f) => f.path).join(", ")}`);
 
     try {
-      // 1. Write the files as before
-      await step.run(uniqueWriteId, () =>
+      await step.run(id, () =>
         Promise.all(
-          files.map((file) =>
-            state.sandbox.files.write(file.path, file.content)
-          )
+          toWrite.map((file) => sandbox.files.write(file.path, file.content))
         )
       );
 
-      // 2. NEW: Read the files back to get their content for verification
-      const uniqueReadId = `read-after-write-${Date.now()}`;
-      const contents = await step.run(uniqueReadId, () =>
-        Promise.all(files.map((file) => state.sandbox.files.read(file.path)))
-      );
+      const updatedWritten = {
+        ...writtenFiles,
+        ...Object.fromEntries(toWrite.map((f) => [f.path, f.content])),
+      };
 
-      // 3. NEW: Create a rich, detailed confirmation message for the agent
-      const fileSummaries = contents
-        .map(
-          (content: any, i: any) =>
-            `File Path: ${files[i].path}\n\`\`\`\n${content}\n\`\`\``
-        )
-        .join("\n\n---\n\n");
+      state.network.data.writtenFiles = updatedWritten;
+      state.mainTaskExecuted = true;
 
-      return `Successfully wrote to ${files.length} file(s). Their current contents are:\n\n${fileSummaries}`;
+      console.log("✅ Files written. Updated writtenFiles:", updatedWritten);
+      return `✅ Wrote ${toWrite.length} file(s): ${toWrite
+        .map((f) => f.path)
+        .join(", ")}`;
     } catch (e: any) {
-      return `Error writing to files: ${e.message}`;
+      return `❌ Error writing files: ${e.message}`;
     }
   }
 );
 
+// Tool: ReadFiles
+
 const ReadFiles = makeToolClass(
   "readFiles",
-  "Reads the content of specified files in the Sandbox",
+  "Reads the content of specified files in the Sandbox.",
   z.object({ files: z.array(z.string()) }),
   async ({ files }, state) => {
-    const uniqueStepId = `read-${files[0]
+    const id = `read-${files[0]
       .replace(/[^a-zA-Z0-9]/g, "_")
       .slice(0, 30)}-${Date.now()}`;
-    console.log(
-      `\n===== Executing: ${uniqueStepId} for files: ${files.join(
-        ", "
-      )} =====\n`
-    );
+    logStep(id, `Reading files: ${files.join(", ")}`);
+
     try {
-      const contents = await state.step.run(uniqueStepId, () =>
+      const contents = await state.step.run(id, () =>
         Promise.all(files.map((file) => state.sandbox.files.read(file)))
       );
+
       return contents.map((content: any, i: any) => ({
         path: files[i],
         content,
       }));
     } catch (e: any) {
-      return `Error reading files: ${e.message}`;
+      return `❌ Error reading files: ${e.message}`;
     }
   }
 );
 
-// --- CUSTOM TOOL-CALLING NODE ---
+// Tool Map Factory
+
+const createToolMap = (state: GraphState) => ({
+  runInTerminal: new RunInTerminal(state),
+  createOrUpdateFiles: new CreateOrUpdateFiles(state),
+  readFiles: new ReadFiles(state),
+});
+
+// Tool Execution Node
+
 const callTools = async (state: GraphState): Promise<Partial<GraphState>> => {
-  const lastMessage = state.messages[state.messages.length - 1] as AIMessage;
-  if (!lastMessage.tool_calls || lastMessage.tool_calls.length === 0) {
+  logState("TOOL NODE (before)", state);
+  const lastMessage = state.messages.at(-1) as AIMessage;
+  if (!lastMessage?.tool_calls?.length) {
     return { messages: [] };
   }
 
-  const toolMap = {
-    runInTerminal: new RunInTerminal(state),
-    createOrUpdateFiles: new CreateOrUpdateFiles(state),
-    readFiles: new ReadFiles(state),
-  };
-
+  const toolMap = createToolMap(state);
   const toolMessages: ToolMessage[] = [];
+
+  // This is correct: use a local variable to track the flag's state for this turn.
   let mainTaskWasExecuted = state.mainTaskExecuted;
 
   for (const toolCall of lastMessage.tool_calls) {
+    console.log(`🔧 Invoking tool: ${toolCall.name}`);
     if (toolCall.name === "createOrUpdateFiles") {
-      mainTaskWasExecuted = true; // Set the flag
+      mainTaskWasExecuted = true;
     }
 
     const tool = toolMap[toolCall.name as keyof typeof toolMap];
-    let output = `Error: Tool "${toolCall.name}" not found.`;
+    let output: any = `❌ Tool "${toolCall.name}" not found.`;
     if (tool) {
       try {
         output = await tool.invoke(toolCall.args);
       } catch (e: any) {
-        output = `Error running tool ${toolCall.name}: ${e.message}`;
+        output = `❌ Error running tool ${toolCall.name}: ${e.message}`;
       }
     }
     toolMessages.push(
@@ -193,61 +179,87 @@ const callTools = async (state: GraphState): Promise<Partial<GraphState>> => {
       })
     );
   }
-  return { messages: toolMessages, mainTaskExecuted: mainTaskWasExecuted };
+
+  const newState: GraphState = {
+    ...state,
+    messages: [...state.messages, ...toolMessages], // Append new messages
+    mainTaskExecuted: mainTaskWasExecuted, // Set the new flag value
+  };
+
+  // logState("TOOL NODE (after)", newState);
+
+  return newState;
 };
 
-// --- GRAPH BUILDER ---
+// LLM Node
+
+const promptFinalSummary = async (messages: any[], llm: any) => {
+  const prompt = new HumanMessage(
+    "The files have been written successfully. Your task is complete. Please provide the final <task_summary> now."
+  );
+  return await llm.invoke([...messages, prompt], { recursionLimit: 1 });
+};
+
+const callLlm =
+  (llm: any, llmWithTools: any) =>
+  async (state: GraphState): Promise<Partial<GraphState>> => {
+    logState("LLM NODE (before)", state);
+    
+    if (state.mainTaskExecuted) {
+      console.log("✅ Main task executed. Prompting for final summary.");
+      const response = await promptFinalSummary(state.messages, llm);
+      return { messages: [response], next: END };
+    }
+
+    const response: AIMessage = await llmWithTools.invoke(state.messages);
+
+    const hasSummary =
+      typeof response.content === "string" &&
+      response.content.includes("<task_summary>");
+      const next = hasSummary
+      ? (console.log("✅ Summary detected."), END)
+      : response.tool_calls?.length
+      ? "tools"
+      : (console.log("🛑 No tool calls or summary. Ending."), END);
+      
+      const newState: GraphState = {
+        ...state,
+      messages: [...state.messages, response],
+      next: next,
+    };
+    
+    logState("LLM NODE (after)", state);
+    return newState;
+  };
+
+// Graph Compiler
+
 export function buildGraph(llm: any) {
-  const placeholderTools = [
+  const tools = [
     new RunInTerminal({} as any),
     new CreateOrUpdateFiles({} as any),
     new ReadFiles({} as any),
   ];
-  const llmWithTools = llm.bindTools(placeholderTools);
 
-  const callLlm = async (state: GraphState) => {
-    if (state.mainTaskExecuted) {
-      // The main task is done. Force the agent to generate the final summary.
-      console.log("✅ Main task executed. Forcing summary generation.");
-      const finalPrompt = new HumanMessage(
-        "The files have been written successfully. Your task is complete. Please provide the final <task_summary> now."
-      );
-      // We use the llm directly, not the one with tools, to prevent further tool calls
-      const response = await llm.invoke([...state.messages, finalPrompt], {
-        recursionLimit: 1,
-      });
-      return { messages: [response], next: END };
-    }
-
-    const response: AIMessage = await llmWithTools.invoke(state.messages, {
-      recursionLimit: 2,
-    });
-
-    const hasTaskSummary =
-      typeof response.content === "string" &&
-      response.content.includes("<task_summary>");
-
-    let nextStep: "tools" | typeof END;
-    if (hasTaskSummary) {
-      console.log("✅ Task summary detected. Ending the agent run.");
-      nextStep = END;
-    } else if (response.tool_calls && response.tool_calls.length > 0) {
-      nextStep = "tools";
-    } else {
-      nextStep = END;
-    }
-    return { messages: [response], next: nextStep };
-  };
+  const llmWithTools = llm.bindTools(tools);
 
   const graph = new StateGraph(GraphAnnotation)
-    .addNode("agent", callLlm)
+    .addNode("agent", callLlm(llm, llmWithTools))
     .addNode("tools", callTools)
     .addEdge(START, "agent")
-    .addEdge("tools", "agent")
-    .addConditionalEdges("agent", (state) => state.next!, {
-      tools: "tools",
-      [END]: END,
-    });
+    .addConditionalEdges(
+      "agent",
+      (state) => {
+        console.log("from condotional node ==> ", state.next);
+
+        return state.next!;
+      },
+      {
+        tools: "tools",
+        [END]: END,
+      }
+    )
+    .addEdge("tools", "agent");
 
   return graph.compile();
 }

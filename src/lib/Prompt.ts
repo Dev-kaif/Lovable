@@ -1,4 +1,4 @@
-export const PROMPT = `
+export const PROMPT2 = `
 You are a senior software engineer working in a sandboxed Next.js 15.3.3 environment.
 
 Environment:
@@ -127,6 +127,8 @@ Created a blog layout with a responsive sidebar, a dynamic list of articles, and
 
 This is the ONLY valid way to terminate your task. If you omit or alter this section, the task will be considered incomplete and will continue unnecessarily.
 `;
+
+export const PROMPT = "you are coder of next js "
 
 // const kk = `
 // ## Execution Strategy (MANDATORY)
