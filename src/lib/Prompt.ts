@@ -38,6 +38,10 @@ Runtime Execution (Strict Rules):
 - Do not attempt to start or restart the app — it is already running and will hot reload when files change.
 - Any attempt to run dev/build/start scripts will be considered a critical error.
 
+Write INSTRUCTION :
+- use createOrUpdateFiles tool for creating or upating files
+- **YOU CAN ONLY UPDATE "app/page.tsx" NEVER WRITE/UPDATE ANY OTHER FILE**
+
 
 
 Instructions:

@@ -3,7 +3,8 @@ import { makeToolClass } from "@/lib/toolClass";
 import z from "zod";
 import { GraphAnnotation, GraphState } from "@/lib/type";
 import { StateGraph, START, END } from "@langchain/langgraph";
-import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage, SystemMessage, ToolMessage } from "@langchain/core/messages";
+import { PROMPT } from "@/lib/Prompt";
 
 // Logging Utility
 const logStep = (id: string, details?: string) => {
@@ -102,6 +103,7 @@ const CreateOrUpdateFiles = makeToolClass(
         .map((f) => f.path)
         .join(", ")}`;
     } catch (e: any) {
+      console.error("❌ File write failed:", e);
       return `❌ Error writing files: ${e.message}`;
     }
   }
@@ -153,20 +155,13 @@ const callTools = async (state: GraphState): Promise<Partial<GraphState>> => {
 
   const toolMap = createToolMap(state);
   const toolMessages: ToolMessage[] = [];
-
-  // Track if main task was executed in this turn
   let mainTaskExecuted = state.mainTaskExecuted;
+  let hasWriteErrors = false;
 
   console.log(`🔧 Processing ${lastMessage.tool_calls.length} tool calls`);
 
   for (const toolCall of lastMessage.tool_calls) {
     console.log(`🔧 Invoking tool: ${toolCall.name} with ID: ${toolCall.id}`);
-
-    // Set flag if createOrUpdateFiles is called
-    if (toolCall.name === "createOrUpdateFiles") {
-      console.log("✅ Setting mainTaskExecuted to true");
-      mainTaskExecuted = true;
-    }
 
     const tool = toolMap[toolCall.name as keyof typeof toolMap];
     let output: any = `❌ Tool "${toolCall.name}" not found.`;
@@ -175,10 +170,29 @@ const callTools = async (state: GraphState): Promise<Partial<GraphState>> => {
       try {
         console.log(`🔧 Executing tool: ${toolCall.name}`);
         output = await tool.invoke(toolCall.args);
+
+        // Only set mainTaskExecuted if createOrUpdateFiles succeeds
+        if (toolCall.name === "createOrUpdateFiles") {
+          if (typeof output === "string" && output.startsWith("✅")) {
+            console.log(
+              "✅ Setting mainTaskExecuted to true - files written successfully"
+            );
+            mainTaskExecuted = true;
+          } else {
+            console.log("❌ File write operation failed or was skipped");
+            hasWriteErrors = true;
+          }
+        }
+
         console.log(`✅ Tool ${toolCall.name} completed successfully`);
       } catch (e: any) {
         console.error(`❌ Tool ${toolCall.name} failed:`, e);
         output = `❌ Error running tool ${toolCall.name}: ${e.message}`;
+
+        // Mark write errors for createOrUpdateFiles
+        if (toolCall.name === "createOrUpdateFiles") {
+          hasWriteErrors = true;
+        }
       }
     }
 
@@ -196,8 +210,9 @@ const callTools = async (state: GraphState): Promise<Partial<GraphState>> => {
 
   // Return the updates to be merged with the state
   return {
-    messages: toolMessages, // This will be concatenated by the reducer
+    messages: toolMessages,
     mainTaskExecuted: mainTaskExecuted,
+    hasWriteErrors: hasWriteErrors, // Track if there were write errors
   };
 };
 
@@ -209,14 +224,153 @@ const promptFinalSummary = async (messages: any[], llm: any) => {
   return await llm.invoke([...messages, prompt], { recursionLimit: 1 });
 };
 
+// Function to check if the current user message is a new task
+const isNewTaskRequest = (messages: any[]): boolean => {
+  const lastHumanMessage = messages
+    .slice()
+    .reverse()
+    .find((msg) => msg._getType() === "human");
+
+  if (!lastHumanMessage) return false;
+
+  const content = lastHumanMessage.content.toLowerCase();
+
+  // Keywords that indicate a new task or additional work
+  const newTaskKeywords = [
+    "add",
+    "create",
+    "build",
+    "make",
+    "implement",
+    "develop",
+    "write",
+    "generate",
+    "setup",
+    "configure",
+    "install",
+    "now",
+    "also",
+    "next",
+    "additionally",
+    "please",
+    "can you",
+    "could you",
+    "would you",
+    "how about",
+    "let's",
+    "try",
+    "modify",
+    "change",
+    "update",
+    "include",
+    "put",
+    "place",
+    "insert",
+    "remove",
+  ];
+
+  // Phrases that indicate continuation rather than new tasks
+  const continuationPhrases = [
+    "continue",
+    "keep going",
+    "proceed",
+    "carry on",
+    "what's next",
+    "status",
+    "how's it going",
+  ];
+
+  // Check for continuation phrases first
+  const isContinuation = continuationPhrases.some((phrase) =>
+    content.includes(phrase)
+  );
+
+  if (isContinuation) {
+    console.log("📋 Detected continuation request, not a new task");
+    return false;
+  }
+
+  // Check if message contains new task keywords
+  const hasNewTaskKeywords = newTaskKeywords.some((keyword) =>
+    content.includes(keyword)
+  );
+
+  console.log(`🔍 New task analysis: "${content.slice(0, 50)}..."`);
+  console.log(`  - Has new task keywords: ${hasNewTaskKeywords}`);
+
+  return hasNewTaskKeywords;
+};
+
 const callLlm =
   (llm: any, llmWithTools: any) =>
   async (state: GraphState): Promise<Partial<GraphState>> => {
     logState("LLM NODE (before)", state);
 
-    // Check if main task was executed and prompt for summary
-    if (state.mainTaskExecuted) {
-      console.log("✅ Main task executed. Prompting for final summary.");
+    // Check if this is a new task request
+    const isNewTask = isNewTaskRequest(state.messages);
+
+    console.log(`🔍 Task Analysis:`);
+    console.log(`  - Is new task: ${isNewTask}`);
+    console.log(`  - Current mainTaskExecuted: ${state.mainTaskExecuted}`);
+    console.log(`  - Has write errors: ${state.hasWriteErrors}`);
+    console.log(`  - Messages count: ${state.messages.length}`);
+
+    // If this is a new task, we should process it regardless of previous completion status
+    if (isNewTask) {
+      console.log("🆕 New task detected - processing fresh request");
+
+      let messagesToProcess = state.messages;
+
+      const hasSystemMessageFirst =
+        messagesToProcess.length > 0 &&
+        messagesToProcess[0]._getType() === "system";
+
+      if (!hasSystemMessageFirst) {
+        console.log("⚠️ No system message at start. Prepending it.");
+        messagesToProcess = [
+          new SystemMessage(PROMPT),
+          ...state.messages.filter((m) => m._getType() !== "system"),
+        ];
+      }
+
+      console.log(
+        `📨 Processing ${messagesToProcess.length} messages for new task`
+      );
+      console.log(
+        `📨 Message types: ${messagesToProcess
+          .map((m) => m._getType())
+          .join(", ")}`
+      );
+
+      // Normal LLM invocation for the new task
+      const response: AIMessage = await llmWithTools.invoke(messagesToProcess);
+
+      // Check for task summary in response
+      const hasSummary =
+        typeof response.content === "string" &&
+        response.content.includes("<task_summary>");
+
+      const next = hasSummary
+        ? (console.log("✅ Summary detected."), END)
+        : response.tool_calls?.length
+        ? "tools"
+        : (console.log("🛑 No tool calls or summary. Ending."), END);
+
+      logState("LLM NODE (after - new task)", state);
+
+      return {
+        messages: [response],
+        next: next,
+        mainTaskExecuted: false, // Reset flag for new task
+        hasWriteErrors: false, // Reset error flag
+      };
+    }
+
+    // For continuing tasks: Check if main task was executed and there are no write errors
+    if (state.mainTaskExecuted && !state.hasWriteErrors) {
+      console.log(
+        "✅ Previous task completed successfully. Prompting for final summary."
+      );
       const response = await promptFinalSummary(state.messages, llm);
       return {
         messages: [response],
@@ -224,7 +378,14 @@ const callLlm =
       };
     }
 
-    // Normal LLM invocation
+    // Normal LLM invocation for continuing the current task
+    console.log(
+      `📨 Processing ${state.messages.length} messages for continuing task`
+    );
+    console.log(
+      `📨 Message types: ${state.messages.map((m) => m._getType()).join(", ")}`
+    );
+
     const response: AIMessage = await llmWithTools.invoke(state.messages);
 
     // Check for task summary in response
@@ -238,10 +399,10 @@ const callLlm =
       ? "tools"
       : (console.log("🛑 No tool calls or summary. Ending."), END);
 
-    logState("LLM NODE (after)", state);
+    logState("LLM NODE (after - continuing task)", state);
 
     return {
-      messages: [response], // This will be concatenated by the reducer
+      messages: [response],
       next: next,
     };
   };

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { inngest } from "./client";
 import { Sandbox } from "@e2b/code-interpreter";
 import { getSandbox } from "./utils";
@@ -27,32 +28,49 @@ export const AiAgent = inngest.createFunction(
       return sandbox.sandboxId;
     });
 
-    const llm = new ChatGoogleGenerativeAI({
-      model: "gemini-2.0-flash",
+    const llm = new ChatOpenAI({
+      // model: "deepseek/deepseek-r1-0528",
+      model: "qwen/qwen3-235b-a22b-2507",
+      // model: "moonshotai/kimi-k2",
       temperature: 0,
-      apiKey: process.env.GEMINI_API_KEY,
+      apiKey: process.env.OPENAI_API_KEY,
+      configuration: {
+        baseURL: "https://openrouter.ai/api/v1",
+      },
       callbacks: [langfuseHandler],
     });
 
+    // const llm = new ChatGoogleGenerativeAI({
+    //   model: "gemini-2.0-flash",
+    //   temperature: 0,
+    //   apiKey: process.env.GEMINI_API_KEY,
+    //   callbacks: [langfuseHandler],
+    // });
+
     const sandbox = await getSandbox(sandboxId);
     const userQuery = event.data.query;
-    const checkpointer = await getCheckpointer(); 
+    const checkpointer = await getCheckpointer();
     // Use a consistent thread ID based on user/session, not random
-    const threadId = event.data.threadId || `thread-${event.user?.id || 'default'}-${event.data.sessionId || 'session'}`;
+    const threadId =
+      event.data.threadId ||
+      `thread-${event.user?.id || "default"}-${
+        event.data.sessionId || "session"
+      }`;
 
     const initialState: GraphState = {
       messages: [new SystemMessage(PROMPT), new HumanMessage(userQuery)],
       step,
-      network: { data: { files: [], writtenFiles: {} } }, 
+      network: { data: { files: [], writtenFiles: {} } },
       sandbox,
       next: null,
       lastToolCallId: null,
       mainTaskExecuted: false,
+      hasWriteErrors: false,
     };
 
     // Build and compile the graph with checkpointer
     const graph = buildGraph(llm);
-    const executable = graph.compile({ checkpointer }); 
+    const executable = graph.compile({ checkpointer });
 
     console.log(`🚀 Starting graph execution with thread ID: ${threadId}`);
 
@@ -68,13 +86,35 @@ export const AiAgent = inngest.createFunction(
     try {
       // Try to get existing state first
       const existingState = await executable.getState(config);
-      console.log(`📊 Existing state found: ${existingState ? 'YES' : 'NO'}`);
-      
-      if (existingState && existingState.values && existingState.values.messages?.length > 2) {
+      console.log(`📊 Existing state found: ${existingState ? "YES" : "NO"}`);
+
+      if (
+        existingState &&
+        existingState.values &&
+        existingState.values.messages?.length > 2
+      ) {
         // Continue from existing state with new user message
-        console.log(`🔄 Continuing existing conversation with ${existingState.values.messages.length} messages`);
+        console.log(
+          `🔄 Continuing existing conversation with ${existingState.values.messages.length} messages`
+        );
+
+        // Get the current state and add the new message properly
+        const currentMessages = existingState.values.messages || [];
+        console.log(
+          `📨 Current message types: ${currentMessages
+            .map((m: any) => m._getType())
+            .join(", ")}`
+        );
+
+        // Create update that adds just the new human message
+        // The state reducer will concatenate it properly
         result = await executable.invoke(
-          { messages: [new HumanMessage(userQuery)] }, // Add new message
+          {
+            messages: [new HumanMessage(userQuery)],
+            // Reset task flags for new requests - the graph will handle this logic
+            mainTaskExecuted: false,
+            hasWriteErrors: false,
+          },
           config
         );
       } else {
@@ -83,7 +123,7 @@ export const AiAgent = inngest.createFunction(
         result = await executable.invoke(initialState, config);
       }
     } catch (error) {
-      console.log(`⚠️ Error checking existing state, starting fresh:`, error );
+      console.log(`⚠️ Error checking existing state, starting fresh:`, error);
       result = await executable.invoke(initialState, config);
     }
 
@@ -100,14 +140,14 @@ export const AiAgent = inngest.createFunction(
       return `https://${host}`;
     });
 
-    return { 
+    return {
       message: sandboxUrl,
       threadId: threadId,
       executionSummary: {
         messagesProcessed: result.messages?.length || 0,
         mainTaskCompleted: result.mainTaskExecuted,
         finalState: result.next,
-      }
+      },
     };
   }
 );

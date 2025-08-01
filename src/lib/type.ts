@@ -56,6 +56,16 @@ export const GraphAnnotation = Annotation.Root({
     },
     default: () => false,
   }),
+  hasWriteErrors: Annotation<boolean>({
+    reducer: (left, right) => {
+      const result = right ?? left;
+      console.log(
+        `❌ HasWriteErrors reducer - left: ${left}, right: ${right}, result: ${result}`
+      );
+      return result;
+    },
+    default: () => false,
+  }),
 });
 
 export type GraphState = typeof GraphAnnotation.State;
