@@ -41,7 +41,7 @@ Runtime Execution (Strict Rules):
 Write INSTRUCTION :
 - use createOrUpdateFiles tool for creating or upating files
 - **YOU CAN ONLY UPDATE "app/page.tsx" NEVER WRITE/UPDATE ANY OTHER FILE**
-
+- **NEVER USE <IMAGE/> TAG FROM next/image always use HTML <img/> tag**
 
 
 Instructions:

@@ -8,7 +8,6 @@ import { buildGraph } from "@/graph/graph_final";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { PROMPT } from "@/lib/Prompt";
 import { CallbackHandler } from "langfuse-langchain";
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { getCheckpointer } from "@/lib/checkpointer";
 
 const langfuseHandler = new CallbackHandler({
@@ -21,16 +20,51 @@ export const AiAgent = inngest.createFunction(
   { id: "Creating new Next app" },
   { event: "aiAgent" },
   async ({ step, event }) => {
-    const sandboxId = await step.run("get-sandbox-id", async () => {
-      const sandbox = await Sandbox.create("lovable-kaif-1try", {
-        timeoutMs: 3 * 300_000,
-      });
-      return sandbox.sandboxId;
+    // Use the provided sandbox ID instead of creating a new one
+    const sandboxId = event.data.sandboxId;
+
+    if (!sandboxId) {
+      throw new Error(
+        "Sandbox ID is required. Please initialize a session first."
+      );
+    }
+
+    console.log(`🔄 Using existing sandbox: ${sandboxId}`);
+
+    // Verify sandbox exists and is accessible
+    const sandboxExists = await step.run("verify-sandbox", async () => {
+      try {
+        const sandbox = await getSandbox(sandboxId);
+        console.log(`✅ Sandbox ${sandboxId} is accessible`);
+        return true;
+      } catch (error) {
+        console.error(`❌ Sandbox ${sandboxId} is not accessible:`, error);
+        return false;
+      }
     });
+
+    if (!sandboxExists) {
+      // If sandbox doesn't exist, create a new one as fallback
+      console.log(`🆕 Creating new sandbox as fallback`);
+      const newSandboxId = await step.run(
+        "create-fallback-sandbox",
+        async () => {
+          const sandbox = await Sandbox.create("lovable-kaif-1try", {
+            timeoutMs: 3 * 300_000,
+          });
+          return sandbox.sandboxId;
+        }
+      );
+
+      // Update the sandbox ID for this execution
+      console.log(`✅ Created fallback sandbox: ${newSandboxId}`);
+      // Note: You might want to update your session store here in a real implementation
+    }
 
     const llm = new ChatOpenAI({
       // model: "deepseek/deepseek-r1-0528",
-      model: "qwen/qwen3-235b-a22b-2507",
+      // model: "qwen/qwen3-235b-a22b-2507",
+      model: "z-ai/glm-4.5",
       // model: "moonshotai/kimi-k2",
       temperature: 0,
       apiKey: process.env.OPENAI_API_KEY,
@@ -50,12 +84,14 @@ export const AiAgent = inngest.createFunction(
     const sandbox = await getSandbox(sandboxId);
     const userQuery = event.data.query;
     const checkpointer = await getCheckpointer();
-    // Use a consistent thread ID based on user/session, not random
+
+    // Use consistent thread ID based on session
     const threadId =
-      event.data.threadId ||
-      `thread-${event.user?.id || "default"}-${
-        event.data.sessionId || "session"
-      }`;
+      event.data.threadId || `thread-${event.data.sessionId || "default"}`;
+
+    console.log(`🎯 Processing query for session: ${event.data.sessionId}`);
+    console.log(`🧵 Thread ID: ${threadId}`);
+    console.log(`📦 Sandbox ID: ${sandboxId}`);
 
     const initialState: GraphState = {
       messages: [new SystemMessage(PROMPT), new HumanMessage(userQuery)],
@@ -106,12 +142,9 @@ export const AiAgent = inngest.createFunction(
             .join(", ")}`
         );
 
-        // Create update that adds just the new human message
-        // The state reducer will concatenate it properly
         result = await executable.invoke(
           {
             messages: [new HumanMessage(userQuery)],
-            // Reset task flags for new requests - the graph will handle this logic
             mainTaskExecuted: false,
             hasWriteErrors: false,
           },
@@ -143,6 +176,8 @@ export const AiAgent = inngest.createFunction(
     return {
       message: sandboxUrl,
       threadId: threadId,
+      sessionId: event.data.sessionId,
+      sandboxId: sandboxId,
       executionSummary: {
         messagesProcessed: result.messages?.length || 0,
         mainTaskCompleted: result.mainTaskExecuted,
