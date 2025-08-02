@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { inngest } from "./client";
 import { Sandbox } from "@e2b/code-interpreter";
 import { getSandbox } from "./utils";
@@ -9,6 +8,11 @@ import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { PROMPT } from "@/lib/Prompt";
 import { CallbackHandler } from "langfuse-langchain";
 import { getCheckpointer } from "@/lib/checkpointer";
+import {
+  filterMessages,
+  filterAllRepetitiveMessages,
+  detectRepetitivePattern,
+} from "@/lib/filterMessages";
 
 const langfuseHandler = new CallbackHandler({
   publicKey: process.env.LANGFUSE_PUBLIC_KEY,
@@ -20,32 +24,19 @@ export const AiAgent = inngest.createFunction(
   { id: "Creating new Next app" },
   { event: "aiAgent" },
   async ({ step, event }) => {
-    // Use the provided sandbox ID instead of creating a new one
     const sandboxId = event.data.sandboxId;
+    if (!sandboxId) throw new Error("Sandbox ID is required");
 
-    if (!sandboxId) {
-      throw new Error(
-        "Sandbox ID is required. Please initialize a session first."
-      );
-    }
-
-    console.log(`🔄 Using existing sandbox: ${sandboxId}`);
-
-    // Verify sandbox exists and is accessible
     const sandboxExists = await step.run("verify-sandbox", async () => {
       try {
-        const sandbox = await getSandbox(sandboxId);
-        console.log(`✅ Sandbox ${sandboxId} is accessible`);
+        await getSandbox(sandboxId);
         return true;
-      } catch (error) {
-        console.error(`❌ Sandbox ${sandboxId} is not accessible:`, error);
+      } catch {
         return false;
       }
     });
 
     if (!sandboxExists) {
-      // If sandbox doesn't exist, create a new one as fallback
-      console.log(`🆕 Creating new sandbox as fallback`);
       const newSandboxId = await step.run(
         "create-fallback-sandbox",
         async () => {
@@ -55,43 +46,28 @@ export const AiAgent = inngest.createFunction(
           return sandbox.sandboxId;
         }
       );
-
-      // Update the sandbox ID for this execution
       console.log(`✅ Created fallback sandbox: ${newSandboxId}`);
-      // Note: You might want to update your session store here in a real implementation
     }
 
     const llm = new ChatOpenAI({
       // model: "deepseek/deepseek-r1-0528",
       // model: "qwen/qwen3-235b-a22b-2507",
-      model: "z-ai/glm-4.5",
-      // model: "moonshotai/kimi-k2",
+      // model: "z-ai/glm-4.5",
+      // model: "openrouter/horizon-alpha",
+      model: "qwen/qwen3-coder:free",
       temperature: 0,
       apiKey: process.env.OPENAI_API_KEY,
-      configuration: {
-        baseURL: "https://openrouter.ai/api/v1",
-      },
+      configuration: { baseURL: "https://openrouter.ai/api/v1" },
       callbacks: [langfuseHandler],
     });
-
-    // const llm = new ChatGoogleGenerativeAI({
-    //   model: "gemini-2.0-flash",
-    //   temperature: 0,
-    //   apiKey: process.env.GEMINI_API_KEY,
-    //   callbacks: [langfuseHandler],
-    // });
 
     const sandbox = await getSandbox(sandboxId);
     const userQuery = event.data.query;
     const checkpointer = await getCheckpointer();
 
-    // Use consistent thread ID based on session
     const threadId =
       event.data.threadId || `thread-${event.data.sessionId || "default"}`;
-
-    console.log(`🎯 Processing query for session: ${event.data.sessionId}`);
-    console.log(`🧵 Thread ID: ${threadId}`);
-    console.log(`📦 Sandbox ID: ${sandboxId}`);
+    console.log(`🎯 Session: ${event.data.sessionId} | 🧵 Thread: ${threadId}`);
 
     const initialState: GraphState = {
       messages: [new SystemMessage(PROMPT), new HumanMessage(userQuery)],
@@ -104,13 +80,9 @@ export const AiAgent = inngest.createFunction(
       hasWriteErrors: false,
     };
 
-    // Build and compile the graph with checkpointer
     const graph = buildGraph(llm);
     const executable = graph.compile({ checkpointer });
 
-    console.log(`🚀 Starting graph execution with thread ID: ${threadId}`);
-
-    // Check if we have existing state for this thread
     const config = {
       configurable: {
         thread_id: threadId,
@@ -120,52 +92,56 @@ export const AiAgent = inngest.createFunction(
 
     let result;
     try {
-      // Try to get existing state first
       const existingState = await executable.getState(config);
-      console.log(`📊 Existing state found: ${existingState ? "YES" : "NO"}`);
+      const hasHistory = existingState?.values?.messages?.length > 2;
 
-      if (
-        existingState &&
-        existingState.values &&
-        existingState.values.messages?.length > 2
-      ) {
-        // Continue from existing state with new user message
-        console.log(
-          `🔄 Continuing existing conversation with ${existingState.values.messages.length} messages`
-        );
-
-        // Get the current state and add the new message properly
+      if (hasHistory) {
         const currentMessages = existingState.values.messages || [];
-        console.log(
-          `📨 Current message types: ${currentMessages
-            .map((m: any) => m._getType())
-            .join(", ")}`
+
+        // 🔧 NEW: Apply repetitive message filtering
+        console.log(`📊 Original message count: ${currentMessages.length}`);
+
+        // Check if there's a repetitive pattern before filtering
+        const hasRepetitivePattern = detectRepetitivePattern(currentMessages);
+        if (hasRepetitivePattern) {
+          console.log(`🔄 Detected repetitive pattern in conversation`);
+        }
+
+        // Apply comprehensive filtering
+        const cleanedMessages = filterAllRepetitiveMessages(
+          currentMessages,
+          5, // windowSize: check last 5 messages
+          3 // threshold: if same message appears 3+ times, filter it
         );
 
-        result = await executable.invoke(
-          {
-            messages: [new HumanMessage(userQuery)],
-            mainTaskExecuted: false,
-            hasWriteErrors: false,
-          },
-          config
+        console.log(`✨ Filtered message count: ${cleanedMessages.length}`);
+        console.log(
+          `🧹 Removed ${
+            currentMessages.length - cleanedMessages.length
+          } repetitive messages`
         );
+
+        // Additional basic filtering (remove context messages, keep main system prompt)
+        const finalMessages = filterMessages(cleanedMessages);
+
+        const mergedState: GraphState = {
+          ...existingState.values,
+          step,
+          sandbox,
+          messages: [...finalMessages, new HumanMessage(userQuery)],
+          mainTaskExecuted: false,
+          hasWriteErrors: false,
+        };
+
+        result = await executable.invoke(mergedState, config);
       } else {
-        // Start fresh conversation
         console.log(`🆕 Starting new conversation`);
         result = await executable.invoke(initialState, config);
       }
     } catch (error) {
-      console.log(`⚠️ Error checking existing state, starting fresh:`, error);
+      console.log(`⚠️ Error retrieving state:`, error);
       result = await executable.invoke(initialState, config);
     }
-
-    console.log("✅ Graph execution completed");
-    console.log("Final state:", {
-      messageCount: result.messages?.length || 0,
-      mainTaskExecuted: result.mainTaskExecuted,
-      next: result.next,
-    });
 
     const sandboxUrl = await step.run("get-sandbox-url", async () => {
       const sandbox = await getSandbox(sandboxId);
@@ -175,9 +151,9 @@ export const AiAgent = inngest.createFunction(
 
     return {
       message: sandboxUrl,
-      threadId: threadId,
+      threadId,
       sessionId: event.data.sessionId,
-      sandboxId: sandboxId,
+      sandboxId,
       executionSummary: {
         messagesProcessed: result.messages?.length || 0,
         mainTaskCompleted: result.mainTaskExecuted,

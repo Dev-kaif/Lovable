@@ -33,7 +33,7 @@ export default function Page() {
   const invoke = useMutation(
     trpc.invoke.mutationOptions({
       onSuccess: (data) => {
-        toast.success("Background job started");
+        toast.success("Started working on your website");
       },
       onError: (error) => {
         toast.error("Failed to start job: " + error.message);
@@ -122,6 +122,11 @@ export default function Page() {
           {sessionId && <p>Session: {sessionId}</p>}
           {threadId && <p>Thread: {threadId}</p>}
           {sandboxId && <p>Sandbox: {sandboxId}</p>}
+          {sandboxId && (
+            <a className="text-white px-3 py-1 bg-blue-500 rounded-2xl mt-10 hover:bg-blue-600" href={`https://3000-${sandboxId}.e2b.app`} target="_blank">
+              Visit Sandbox
+            </a>
+          )}
         </div>
 
         <div className="space-y-4">
