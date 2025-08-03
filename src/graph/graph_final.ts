@@ -10,36 +10,7 @@ import {
   SystemMessage,
   ToolMessage,
 } from "@langchain/core/messages";
-import {
-  filterAllRepetitiveMessages,
-  detectRepetitivePattern,
-} from "@/lib/filterMessages";
-
-// Enhanced system message filtering to remove duplicates
-function filterSystemMessages(messages: BaseMessage[]): BaseMessage[] {
-  let systemMessage: SystemMessage | null = null;
-  const nonSystemMessages: BaseMessage[] = [];
-
-  for (const message of messages) {
-    if (message instanceof SystemMessage) {
-      // Only keep the first system message we encounter
-      if (
-        !systemMessage &&
-        message.content
-          .toString()
-          .includes("You are a senior software engineer")
-      ) {
-        systemMessage = message;
-      }
-    } else {
-      nonSystemMessages.push(message);
-    }
-  }
-
-  return systemMessage
-    ? [systemMessage, ...nonSystemMessages]
-    : nonSystemMessages;
-}
+import { masterMessageFilter } from "@/lib/filterMessages";
 
 // Logging Utility
 const logStep = (id: string, details?: string) => {
@@ -91,10 +62,10 @@ const RunInTerminal = makeToolClass(
   }
 );
 
-// Tool: CreateOrUpdateFiles - FIXED WITH DUPLICATE DETECTION
+// Tool: CreateOrUpdateFiles with better duplicate detection
 const CreateOrUpdateFiles = makeToolClass(
   "createOrUpdateFiles",
-  "Creates or updates files in the Sandbox.",
+  "Creates or updates files in the Sandbox with advanced duplicate detection.",
   z.object({
     files: z.array(z.object({ path: z.string(), content: z.string() })),
   }),
@@ -103,34 +74,65 @@ const CreateOrUpdateFiles = makeToolClass(
     const state = getState();
     const writtenFiles = state.network?.data?.writtenFiles ?? {};
 
-    // Check if files already exist with same content
-    const duplicateFiles = files.filter(
-      (file) => writtenFiles[file.path] === file.content
-    );
+    // 🔧 ENHANCED: More sophisticated duplicate detection
+    const fileAnalysis = files.map((file) => {
+      const existingContent = writtenFiles[file.path];
+      const isIdentical = existingContent === file.content;
+      const isSimilar =
+        existingContent &&
+        file.content.replace(/\s+/g, " ").trim() ===
+          existingContent.replace(/\s+/g, " ").trim();
 
-    if (duplicateFiles.length === files.length) {
-      return "⚠️ All requested files already exist with identical content. No changes needed. Task appears to be complete.";
+      return {
+        ...file,
+        isIdentical,
+        isSimilar,
+        exists: !!existingContent,
+      };
+    });
+
+    const identicalFiles = fileAnalysis.filter((f) => f.isIdentical);
+    const similarFiles = fileAnalysis.filter(
+      (f) => f.isSimilar && !f.isIdentical
+    );
+    const newFiles = fileAnalysis.filter((f) => !f.isIdentical && !f.isSimilar);
+
+    // If all files are identical, task is complete
+    if (identicalFiles.length === files.length) {
+      console.log("🔄 All files identical - task already completed");
+      return "⚠️ All requested files already exist with identical content. Task is complete.";
     }
 
-    const toWrite = files.filter(
-      (file) => writtenFiles[file.path] !== file.content
-    );
+    // If we have similar files, just mark as complete to avoid minor whitespace iterations
+    if (similarFiles.length > 0 && newFiles.length === 0) {
+      console.log("🔄 Files are similar enough - considering task complete");
+      return "✅ Files exist with similar content. Task is essentially complete.";
+    }
 
+    // Only write truly new/different files
+    if (newFiles.length === 0) {
+      return "⚠️ No new changes detected. Task appears to be complete.";
+    }
+
+    const toWrite = newFiles;
     const id = `write-${toWrite[0].path
       .replace(/[^a-zA-Z0-9]/g, "_")
       .slice(0, 30)}-${Date.now()}`;
 
     try {
-      await step.run(id, () =>
-        Promise.all(
-          toWrite.map((file) => sandbox.files.write(file.path, file.content))
-        )
-      );
+      await step.run(id, async () => {
+        const writePromises = toWrite.map((file) =>
+          sandbox.files.write(file.path, file.content)
+        );
+        await Promise.all(writePromises);
+      });
 
       const updatedWritten = {
         ...writtenFiles,
         ...Object.fromEntries(toWrite.map((f) => [f.path, f.content])),
       };
+
+      console.log(`✅ Successfully wrote ${toWrite.length} new/modified files`);
 
       return {
         result: `✅ Successfully wrote ${toWrite.length} file(s): ${toWrite
@@ -149,7 +151,7 @@ const CreateOrUpdateFiles = makeToolClass(
   }
 );
 
-// Tool: ReadFiles - FIXED TO RETURN PROPER FORMAT
+// Tool: ReadFiles with proper parameter handling
 const ReadFiles = makeToolClass(
   "readFiles",
   "Reads the content of specified files in the Sandbox.",
@@ -161,22 +163,48 @@ const ReadFiles = makeToolClass(
     logStep(id, `Reading files: ${files.join(", ")}`);
 
     try {
-      const contents = await context.step.run(id, () =>
-        Promise.all(files.map((file) => context.sandbox.files.read(file)))
-      );
 
-      const fileContents = contents.map((content: any, i: any) => ({
+
+      const contents = async () => {
+        const results = [];
+        for (const file of files) {
+          const content = await context.sandbox.files.read(file);
+          results.push(content);
+        }
+        return results;
+      };
+
+      const results = await contents();
+
+
+      const fileContents = await results.map((content: any, i: any) => ({
         path: files[i],
         content,
       }));
 
-      // Return a readable format instead of JSON string
-      return fileContents
+      console.log("fileContents result ===> \n", fileContents, "\n\n");
+
+      const formattedContent = fileContents
         .map(
           (fc: any) =>
             `=== ${fc.path} ===\n${fc.content}\n=== END ${fc.path} ===`
         )
         .join("\n\n");
+
+      console.log("📖 ReadFiles - Content length:", formattedContent.length);
+      console.log(
+        "📖 ReadFiles - Content preview:",
+        formattedContent.slice(0, 300)
+      );
+
+      return {
+        result: formattedContent,
+        network: {
+          data: {
+            lastReadFiles: formattedContent,
+          },
+        },
+      };
     } catch (e: any) {
       return `❌ Error reading files: ${e.message}`;
     }
@@ -197,10 +225,14 @@ const createToolMap = (state: GraphState) => {
   };
 };
 
-// Tool Execution Node - FIXED MESSAGE HANDLING
+// Tool Execution Node with proper state management
 const callTools = async (state: GraphState): Promise<Partial<GraphState>> => {
+  console.log("🔧 ENTERING callTools function");
   logState("TOOL NODE (before)", state);
+
   const lastMessage = state.messages.at(-1) as AIMessage;
+  console.log("📧 Last message:", lastMessage);
+  console.log("🔧 Tool calls found:", lastMessage?.tool_calls?.length || 0);
 
   if (!lastMessage?.tool_calls?.length) {
     console.log("⚠️ No tool calls found in last message");
@@ -213,38 +245,103 @@ const callTools = async (state: GraphState): Promise<Partial<GraphState>> => {
   let mainTaskExecuted = state.mainTaskExecuted;
   let hasWriteErrors = false;
 
-  // Accumulate updates from tool executions
-  let stateUpdates: Partial<GraphState> = {};
+  // 🚀 CRITICAL: Start with existing network state
+  const networkUpdate = {
+    data: {
+      files: [...(state.network?.data?.files || [])],
+      writtenFiles: { ...(state.network?.data?.writtenFiles || {}) },
+      lastReadFiles: state.network?.data?.lastReadFiles || null,
+    },
+  };
 
   for (const toolCall of lastMessage.tool_calls) {
+    console.log(`🔧 Processing tool call: ${toolCall.name}`);
+    console.log(`🔧 Tool call args:`, toolCall.args);
+
     const tool = toolMap[toolCall.name as keyof typeof toolMap];
     let rawOutput: any = `❌ Tool "${toolCall.name}" not found.`;
 
     if (tool) {
       try {
-        rawOutput = await tool.invoke(toolCall.args);
+        // Fix common parameter issues before calling tool
+        let fixedArgs = toolCall.args;
 
-        // If tool returned { result, ...rest }, extract them
+        // Fix readFiles parameter name issue
+        if (
+          toolCall.name === "readFiles" &&
+          fixedArgs.paths &&
+          !fixedArgs.files
+        ) {
+          console.log("🔧 Fixing readFiles parameter: paths → files");
+          fixedArgs = { files: fixedArgs.paths };
+        }
+
+        // Fix createOrUpdateFiles stringified array issue
+        if (
+          toolCall.name === "createOrUpdateFiles" &&
+          typeof fixedArgs.files === "string"
+        ) {
+          try {
+            console.log("🔧 Fixing createOrUpdateFiles stringified array");
+            fixedArgs = { files: JSON.parse(fixedArgs.files) };
+          } catch (parseError) {
+            console.error("❌ Failed to parse files string:", parseError);
+            rawOutput = `❌ Tool ${toolCall.name} failed: files parameter is a malformed JSON string`;
+            continue;
+          }
+        }
+
+        console.log(
+          `🔧 Calling tool ${toolCall.name} with fixed args:`,
+          fixedArgs
+        );
+        rawOutput = await tool.invoke(fixedArgs);
+        console.log(
+          `🔧 Tool ${toolCall.name} returned:`,
+          typeof rawOutput,
+          rawOutput?.slice?.(0, 200) || rawOutput
+        );
+
+        // 🚀 CRITICAL FIX: Handle tool response properly
         if (
           typeof rawOutput === "object" &&
           rawOutput !== null &&
           "result" in rawOutput
         ) {
-          const { result, ...rest } = rawOutput;
-          stateUpdates = {
-            ...stateUpdates,
-            ...(rest as Partial<GraphState>),
-          };
-          rawOutput = result; // For message content
+          const { result, network, ...rest } = rawOutput;
+
+          // Merge network updates
+          if (network?.data) {
+            console.log(
+              `🌐 Merging network data from ${toolCall.name}:`,
+              network.data
+            );
+            Object.assign(networkUpdate.data, network.data);
+
+            // Special handling for readFiles
+            if (toolCall.name === "readFiles" && network.data.lastReadFiles) {
+              console.log("📖 CAPTURED FILE CONTENT IN NETWORK STATE");
+              console.log(
+                "📖 Content length:",
+                network.data.lastReadFiles.length
+              );
+            }
+          }
+
+          // Use result as the tool message content
+          rawOutput = result;
         }
 
-        // Check for successful completion or duplicate detection
+        // Enhanced completion detection
         const isTaskComplete =
           typeof rawOutput === "string" &&
           (rawOutput.includes("✅ Successfully wrote") ||
             rawOutput.includes("already exist with identical content") ||
             rawOutput.includes("Task completed") ||
-            rawOutput.includes("Task appears to be complete"));
+            rawOutput.includes("Task appears to be complete") ||
+            rawOutput.includes("Task is complete") ||
+            rawOutput.includes("essentially complete") ||
+            rawOutput.includes("TASK COMPLETION DETECTED"));
 
         if (toolCall.name === "createOrUpdateFiles") {
           if (isTaskComplete) {
@@ -275,96 +372,70 @@ const callTools = async (state: GraphState): Promise<Partial<GraphState>> => {
 
     toolMessages.push(toolMessage);
     console.log(
-      `📧 Created tool message for ${toolCall.name}:`,
-      toolMessage.content.slice(0, 100) + "..."
+      `📧 CREATED TOOL MESSAGE for ${toolCall.name}:`,
+      toolMessage.content.slice(0, 200) + "..."
     );
   }
 
-  logState("TOOL NODE (after)", state);
+  console.log(`📧 TOTAL TOOL MESSAGES CREATED: ${toolMessages.length}`);
 
-  return {
-    ...stateUpdates,
-    messages: toolMessages, // This will be concatenated with existing messages
+  // 🚀 CRITICAL: Log final network state before returning
+  console.log("🌐 FINAL NETWORK STATE BEFORE RETURN:");
+  console.log("- lastReadFiles exists:", !!networkUpdate.data.lastReadFiles);
+  console.log(
+    "- lastReadFiles length:",
+    networkUpdate.data.lastReadFiles?.length || 0
+  );
+  console.log(
+    "- writtenFiles count:",
+    Object.keys(networkUpdate.data.writtenFiles).length
+  );
+
+  const finalUpdate = {
+    messages: toolMessages,
     mainTaskExecuted,
     hasWriteErrors,
+    network: networkUpdate, // 🚀 CRITICAL: Include network update
   };
-};
 
-// LLM Node - ENHANCED WITH REPETITIVE MESSAGE FILTERING
-const promptFinalSummary = async (messages: any[], llm: any) => {
-  const prompt = new HumanMessage(
-    "The files have been written successfully. Your task is complete. Please provide the final <task_summary> now."
-  );
-  return await llm.invoke([...messages, prompt], { recursionLimit: 1 });
-};
-
-// Enhanced repetitive pattern detection with filtering
-const detectAndFilterRepetitivePattern = (
-  messages: BaseMessage[]
-): {
-  hasRepetition: boolean;
-  filteredMessages: BaseMessage[];
-} => {
-  // 🔧 FIRST: Remove duplicate system messages
-  const systemFiltered = filterSystemMessages(messages);
+  console.log("🔧 RETURNING FROM callTools:");
+  console.log("- Messages:", finalUpdate.messages?.length || 0);
+  console.log("- Network included:", !!finalUpdate.network);
   console.log(
-    `📊 System message filtering: ${messages.length} → ${systemFiltered.length} messages`
+    "- Network data keys:",
+    Object.keys(finalUpdate.network?.data || {})
   );
 
-  // 🔧 SECOND: Check for repetitive patterns
-  const hasRepetition = detectRepetitivePattern(systemFiltered, 5, 3);
-
-  if (hasRepetition) {
-    console.log(
-      "🔄 Detected repetitive pattern - applying comprehensive filtering"
-    );
-
-    // Apply comprehensive filtering to remove repetitive messages
-    const filteredMessages = filterAllRepetitiveMessages(
-      systemFiltered,
-      5, // windowSize: check last 5 messages
-      3 // threshold: if same message appears 3+ times, filter it
-    );
-
-    console.log(
-      `📊 Repetitive filtering: ${systemFiltered.length} → ${filteredMessages.length} messages`
-    );
-    console.log(
-      `🧹 Total removed: ${messages.length - filteredMessages.length} messages`
-    );
-
-    return { hasRepetition: true, filteredMessages };
-  }
-
-  return { hasRepetition: false, filteredMessages: systemFiltered };
+  return finalUpdate;
 };
 
+// Also debug the LLM call to see if it receives the tool messages
 export const callLlm =
   (llm: any, llmWithTools: any) =>
   async (state: GraphState): Promise<Partial<GraphState>> => {
+    console.log("🤖 ENTERING callLlm function");
     logState("LLM NODE (before)", state);
 
-    // 🔧 NEW: Apply repetitive message filtering before processing
-    const { hasRepetition, filteredMessages } =
-      detectAndFilterRepetitivePattern(state.messages);
-
-    // If we detected and filtered repetitive messages, update the state
-    const currentMessages = filteredMessages;
-
-    // If there was significant repetition, force completion
-    if (hasRepetition && state.messages.length - filteredMessages.length >= 3) {
-      console.log("🔄 High repetition detected - forcing completion");
-      const response = await promptFinalSummary(currentMessages, llm);
-      return {
-        messages: [response],
-        next: END,
-        mainTaskExecuted: true,
-      };
+    // Check for file contents in state
+    const fileContents = state.network?.data?.lastReadFiles;
+    if (fileContents) {
+      console.log(
+        "📖 FILE CONTENTS AVAILABLE IN STATE - Length:",
+        fileContents.length
+      );
+      console.log("📖 First 200 chars:", fileContents.slice(0, 200));
+    } else {
+      console.log("❌ NO FILE CONTENTS IN STATE");
     }
 
-    // Log all messages to debug
-    console.log("\n🔍 ALL MESSAGES IN STATE (after filtering):");
-    currentMessages.forEach((msg, idx) => {
+    // Apply message filtering
+    const filterResult = masterMessageFilter(state.messages, {
+      enableCompression: false,
+      autoTerminateLoops: false,
+    });
+
+    console.log("🔍 MESSAGES AFTER FILTERING:", filterResult.messages.length);
+    filterResult.messages.forEach((msg, idx) => {
       console.log(
         `${idx}: ${msg.constructor.name} - ${msg.content
           ?.toString()
@@ -372,7 +443,33 @@ export const callLlm =
       );
     });
 
-    // Case 1: Main task executed -> use plain LLM for summary
+    // Handle loop detection logic...
+    if (filterResult.loopDetected && filterResult.shouldTerminate) {
+      const hasCompletedWork = state.messages.some(
+        (msg) =>
+          msg.content?.toString().includes("✅ Successfully wrote") ||
+          msg.content?.toString().includes("Task completed")
+      );
+
+      if (hasCompletedWork) {
+        console.log(
+          "🔄 Loop detected with completed work - forcing completion"
+        );
+        const completionResponse = await promptFinalSummary(
+          filterResult.messages,
+          llm
+        );
+        return {
+          messages: [completionResponse],
+          next: END,
+          mainTaskExecuted: true,
+        };
+      }
+    }
+
+    const currentMessages = filterResult.messages;
+
+    // Handle completion cases...
     if (state.mainTaskExecuted) {
       console.log("✅ Main task executed. Prompting for final summary.");
       const response = await promptFinalSummary(currentMessages, llm);
@@ -382,7 +479,32 @@ export const callLlm =
       };
     }
 
-    // Case 2: Normal LLM run with tool support
+    // Check for task completion...
+    const hasCompletedFiles =
+      Object.keys(state.network?.data?.writtenFiles || {}).length > 0;
+    if (hasCompletedFiles) {
+      const recentMessages = currentMessages.slice(-3);
+      const hasCompletionSignals = recentMessages.some(
+        (msg) =>
+          msg.content
+            ?.toString()
+            .includes("already exist with identical content") ||
+          msg.content?.toString().includes("Task completed") ||
+          msg.content?.toString().includes("essentially complete")
+      );
+
+      if (hasCompletionSignals) {
+        console.log("✅ Completion signals detected - generating summary");
+        const response = await promptFinalSummary(currentMessages, llm);
+        return {
+          messages: [response],
+          next: END,
+          mainTaskExecuted: true,
+        };
+      }
+    }
+
+    // 🚀 ENHANCED: Create system message with file contents
     const stateSummary = JSON.stringify(
       {
         files: state.network?.data?.files || [],
@@ -396,33 +518,45 @@ export const callLlm =
       2
     );
 
-    // Enhanced context with completion status
     const needsContext =
       Object.keys(state.network?.data?.writtenFiles || {}).length > 0;
-    const userMessages: BaseMessage[] = currentMessages; // Already filtered above
+    const userMessages: BaseMessage[] = currentMessages;
 
-    // Add context about completed files (but don't add another system message if we already have one)
     const hasSystemMessage = currentMessages.some(
       (msg) => msg instanceof SystemMessage
     );
-    const contextMessage =
-      needsContext && !hasSystemMessage
-        ? new SystemMessage(`System context:
+
+    let contextMessage = null;
+    if (needsContext && !hasSystemMessage) {
+      let contextContent = `System context:
 ${stateSummary}
 
-IMPORTANT: Before creating or updating files, check if they already exist with the same content in writtenFiles. If they do, the task is likely already complete and you should provide the final <task_summary>.`)
-        : null;
+IMPORTANT: Before creating or updating files, check if they already exist with the same content in writtenFiles. If they do, the task is likely already complete and you should provide the final <task_summary>.
+
+TOOL USAGE CORRECTIONS:
+- For readFiles tool, use parameter "files" (array of strings), NOT "paths"
+- For createOrUpdateFiles tool, ensure "files" is a proper array, not a stringified JSON
+- Always check tool responses for completion signals before making more tool calls`;
+
+      // 🚀 CRITICAL: Add file contents to context
+      if (fileContents) {
+        contextContent += `\n\n📖 CURRENTLY READ FILE CONTENTS:\n${fileContents}`;
+        console.log("📖 INCLUDING FILE CONTENTS IN LLM CONTEXT");
+      }
+
+      contextMessage = new SystemMessage(contextContent);
+    }
 
     const fullMessages = contextMessage
       ? [contextMessage, ...userMessages]
       : userMessages;
 
-    console.log("\n🔍 MESSAGES SENT TO LLM:");
+    console.log("\n🔍 FINAL MESSAGES SENT TO LLM:");
     fullMessages.forEach((msg, idx) => {
       console.log(
-        `${idx}: ${msg.constructor.name} - ${msg.content
-          ?.toString()
-          .slice(0, 100)}...`
+        `${idx}: ${msg.constructor.name} - Length: ${
+          msg.content?.toString().length
+        } - Preview: ${msg.content?.toString().slice(0, 100)}...`
       );
     });
 
@@ -440,14 +574,31 @@ IMPORTANT: Before creating or updating files, check if they already exist with t
 
     logState("LLM NODE (after)", state);
 
-    // 🔧 NEW: Return the filtered messages as part of the state update
     return {
-      messages: hasRepetition ? [...filteredMessages, response] : [response],
+      messages:
+        filterResult.stats.removed > 0
+          ? [...filterResult.messages, response]
+          : [response],
       next: next,
+      network: {
+        ...state.network,
+        data: {
+          ...state.network?.data,
+          lastReadFiles: null,
+        },
+      },
     };
   };
 
-// Graph Compiler - UNCHANGED
+//  LLM Node with better message filtering and completion detection
+const promptFinalSummary = async (messages: any[], llm: any) => {
+  const prompt = new HumanMessage(
+    "The files have been written successfully. Your task is complete. Please provide the final <task_summary> now."
+  );
+  return await llm.invoke([...messages, prompt], { recursionLimit: 1 });
+};
+
+// Graph Compiler
 export function buildGraph(llm: any) {
   // Create tool instances for binding (these are just for schema)
   const toolSchemas = [

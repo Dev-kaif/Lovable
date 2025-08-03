@@ -1,69 +1,130 @@
-import { BaseMessage, SystemMessage } from "@langchain/core/messages";
+import {
+  BaseMessage,
+  SystemMessage,
+  HumanMessage,
+  ToolMessage,
+} from "@langchain/core/messages";
 
-/**
- * Filters the message array to:
- * - Retain only one SystemMessage (latest or first)
- * - Preserve order (SystemMessage comes first)
- */
-
-export const filterMessages = (messages: BaseMessage[]): BaseMessage[] => {
-  const nonSystemMessages = messages.filter(
-    (msg) => !(msg instanceof SystemMessage)
-  );
-  const firstSystem = messages.find((msg) => msg instanceof SystemMessage);
-  return firstSystem ? [firstSystem, ...nonSystemMessages] : nonSystemMessages;
-};
-
-/**
- * Optional: You can also inject a fresh system message and
- * ensure only one is present in total.
- */
-export function injectSingleSystemMessage({
-  messages,
-  systemContent,
-}: {
-  messages: BaseMessage[];
-  systemContent: string;
-}): BaseMessage[] {
-  const filtered = messages.filter((m) => !(m instanceof SystemMessage));
-  return [new SystemMessage(systemContent), ...filtered];
+interface MessageSummary {
+  type: string;
+  contentHash: string;
+  timestamp?: number;
 }
 
-import { HumanMessage, ToolMessage } from "@langchain/core/messages";
+// Generate a hash for message content
+function hashContent(content: string): string {
+  return content.toLowerCase().trim().replace(/\s+/g, " ");
+}
+
+// Create a unique signature for a message
+function getMessageSignature(message: BaseMessage): MessageSummary {
+  const content = message.content?.toString() || "";
+  return {
+    type: message.constructor.name,
+    contentHash: hashContent(content),
+    timestamp: Date.now(),
+  };
+}
 
 /**
- * Filters out repetitive messages from the conversation history
- * Keeps the first occurrence and removes subsequent duplicates
+ * 🚀 FIXED: Less aggressive repetitive message filter
  */
-export function filterRepetitiveMessages(
-  messages: BaseMessage[]
+export function filterRepetitiveMessagesAdvanced(
+  messages: BaseMessage[],
+  options: {
+    maxDuplicates?: number;
+    recentWindowSize?: number;
+    aggressiveMode?: boolean;
+    preserveSystemMessages?: boolean;
+    preserveToolMessages?: boolean;
+  } = {}
 ): BaseMessage[] {
-  const seen = new Set<string>();
+  const {
+    maxDuplicates = 2, // 🔧 INCREASED from 2 to 3
+    recentWindowSize = 8, // 🔧 INCREASED from 8 to 10
+    aggressiveMode = true, // 🔧 CHANGED from true to false
+    preserveSystemMessages = true,
+    preserveToolMessages = true,
+  } = options;
+
+  if (messages.length === 0) return messages;
+
   const filtered: BaseMessage[] = [];
+  const contentCounts = new Map<string, number>();
+  const lastSeenIndex = new Map<string, number>();
 
-  for (const message of messages) {
-    // Create a unique key based on message type and content
-    const messageKey = `${message.constructor.name}:${message.content
-      ?.toString()
-      .toLowerCase()
-      .trim()}`;
+  // 🔧 FIXED: Track consecutive identical requests more carefully
+  let consecutiveCount = 0;
+  let lastUserMessage = "";
 
-    // Always keep SystemMessages (they're usually important prompts)
-    if (message instanceof SystemMessage) {
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    const signature = getMessageSignature(message);
+    const key = `${signature.type}:${signature.contentHash}`;
+
+    // Always preserve certain message types if specified
+    if (preserveSystemMessages && message instanceof SystemMessage) {
+      // Only keep the first system message that contains the main prompt
+      if (
+        !filtered.some(
+          (m) =>
+            m instanceof SystemMessage &&
+            m.content.toString().includes("You are a senior software engineer")
+        )
+      ) {
+        filtered.push(message);
+      }
+      continue;
+    }
+
+    if (preserveToolMessages && message instanceof ToolMessage) {
       filtered.push(message);
       continue;
     }
 
-    // Always keep ToolMessages (they contain execution results)
-    if (message instanceof ToolMessage) {
-      filtered.push(message);
-      continue;
+    // 🔧 FIXED: Track consecutive identical human messages more carefully
+    if (message instanceof HumanMessage) {
+      const currentContent = signature.contentHash;
+      if (currentContent === lastUserMessage) {
+        consecutiveCount++;
+      } else {
+        consecutiveCount = 1;
+        lastUserMessage = currentContent;
+      }
+
+      // 🔧 FIXED: Only block after 4+ consecutive identical requests (was 2)
+      if (aggressiveMode && consecutiveCount > 2) {
+        console.log(
+          `🚫 Blocking consecutive duplicate: "${currentContent.slice(
+            0,
+            50
+          )}..."`
+        );
+        continue;
+      }
     }
 
-    // For HumanMessage and AIMessage, check for duplicates
-    if (!seen.has(messageKey)) {
-      seen.add(messageKey);
+    // Count occurrences
+    const currentCount = contentCounts.get(key) || 0;
+    const lastIndex = lastSeenIndex.get(key);
+
+    // Check if we should include this message
+    let shouldInclude = true;
+
+    if (currentCount >= maxDuplicates) {
+      // Check if it's within recent window
+      if (lastIndex !== undefined && i - lastIndex < recentWindowSize) {
+        shouldInclude = false;
+        console.log(
+          `🔄 Filtered duplicate within window: ${key.slice(0, 50)}...`
+        );
+      }
+    }
+
+    if (shouldInclude) {
       filtered.push(message);
+      contentCounts.set(key, currentCount + 1);
+      lastSeenIndex.set(key, i);
     }
   }
 
@@ -71,118 +132,230 @@ export function filterRepetitiveMessages(
 }
 
 /**
- * More advanced filter that detects repetitive patterns in recent messages
- * Useful for detecting when a user keeps asking the same thing
+ * 🚀 FIXED: More conservative repetitive loop detection
  */
-export function filterRepetitiveRecentMessages(
+export function detectRepetitiveLoop(
   messages: BaseMessage[],
-  windowSize: number = 5,
-  threshold: number = 3
-): BaseMessage[] {
-  if (messages.length <= windowSize) {
-    return messages;
-  }
-
-  // Get recent human messages to check for repetition
+  threshold: number = 3// 🔧 INCREASED from 3 to 5
+): {
+  hasLoop: boolean;
+  pattern?: string;
+  count?: number;
+  shouldTerminate?: boolean;
+} {
   const recentHumanMessages = messages
-    .slice(-windowSize)
     .filter((msg) => msg instanceof HumanMessage)
-    .map((msg) => msg.content?.toString().toLowerCase().trim());
+    .slice(-6) // 🔧 INCREASED from 6 to 8
+    .map((msg) => hashContent(msg.content?.toString() || ""));
 
   if (recentHumanMessages.length < threshold) {
-    return messages;
+    return { hasLoop: false };
   }
 
-  // Check if the last message is repeated too many times
+  // Check for exact repetitions
   const lastMessage = recentHumanMessages[recentHumanMessages.length - 1];
   const repetitionCount = recentHumanMessages.filter(
     (msg) => msg === lastMessage
   ).length;
 
-  if (repetitionCount >= threshold) {
-    // Remove the repetitive messages, keep only the first occurrence
-    const result: BaseMessage[] = [];
-    const seenContent = new Set<string>();
-
-    for (const message of messages) {
-      if (message instanceof HumanMessage) {
-        const content = message.content?.toString().toLowerCase().trim();
-        if (content === lastMessage) {
-          if (!seenContent.has(content)) {
-            seenContent.add(content);
-            result.push(message);
-          }
-          // Skip subsequent duplicates
-        } else {
-          result.push(message);
-        }
-      } else {
-        result.push(message);
-      }
-    }
-
-    return result;
-  }
-
-  return messages;
-}
-
-/**
- * Combined filter that handles both general duplicates and recent repetitive patterns
- */
-export function filterAllRepetitiveMessages(
-  messages: BaseMessage[],
-  recentWindowSize: number = 5,
-  repetitionThreshold: number = 3
-): BaseMessage[] {
-  // First filter out general duplicates
-  let filtered = filterRepetitiveMessages(messages);
-
-  // Then check for recent repetitive patterns
-  filtered = filterRepetitiveRecentMessages(
-    filtered,
-    recentWindowSize,
-    repetitionThreshold
+  // 🔧 FIXED: Only consider it a loop if we have actual progress indicators
+  const hasActualProgress = messages.some(
+    (msg) =>
+      msg instanceof ToolMessage &&
+      typeof msg.content === "string" &&
+      (msg.content.includes("✅ Successfully wrote") ||
+        msg.content.includes("Command executed successfully") ||
+        msg.content.includes("=== END"))
   );
 
-  return filtered;
+  // 🔧 FIXED: If we have progress, don't consider it a problematic loop
+  if (hasActualProgress && repetitionCount < 6) {
+    return { hasLoop: false };
+  }
+
+  if (repetitionCount >= threshold) {
+    return {
+      hasLoop: true,
+      pattern: lastMessage.slice(0, 50),
+      count: repetitionCount,
+      shouldTerminate: repetitionCount >= 4, // 🔧 INCREASED from 4 to 7
+    };
+  }
+
+  return { hasLoop: false };
 }
 
 /**
- * Utility function to detect if there's a repetitive pattern in recent messages
- * Returns true if repetition is detected
+ * Smart message compression - removes redundant context while preserving important information
  */
-export function detectRepetitivePattern(
+export function compressMessageHistory(
   messages: BaseMessage[],
-  windowSize: number = 5,
-  threshold: number = 3
-): boolean {
-  const recentUserMessages = messages
-    .filter((msg) => msg instanceof HumanMessage)
-    .slice(-windowSize)
-    .map((msg) => msg.content?.toString().toLowerCase().trim());
+  maxLength: number = 20// 🔧 INCREASED from 20 to 25
+): BaseMessage[] {
+  if (messages.length <= maxLength) return messages;
 
-  if (recentUserMessages.length < threshold) return false;
+  const compressed: BaseMessage[] = [];
 
-  const lastMessage = recentUserMessages[recentUserMessages.length - 1];
-  const identicalCount = recentUserMessages.filter(
-    (msg) => msg === lastMessage
-  ).length;
+  // Always keep the first system message
+  const systemMessage = messages.find((msg) => msg instanceof SystemMessage);
+  if (systemMessage) compressed.push(systemMessage);
 
-  return identicalCount >= threshold;
+  // Keep recent messages (last 15) - 🔧 INCREASED from 10 to 15
+  const recentMessages = messages
+    .slice(-10)
+    .filter((msg) => !(msg instanceof SystemMessage));
+
+  // Keep important milestone messages (successful operations)
+  const milestones = messages
+    .filter(
+      (msg) =>
+        msg instanceof ToolMessage &&
+        typeof msg.content === "string" &&
+        msg.content.includes("Successfully wrote")
+    )
+    .slice(-3); // Keep last 3 successful operations
+
+  // Combine and deduplicate
+  const combined = [...compressed, ...milestones, ...recentMessages];
+  return filterRepetitiveMessagesAdvanced(combined, { aggressiveMode: false });
 }
 
-// Example usage in your existing code:
-/*
-// In your functions.ts, you could use it like this:
-const cleanedMessages = filterAllRepetitiveMessages(currentMessages);
+/**
+ * 🚀 FIXED: Less aggressive master filter function
+ */
+export function masterMessageFilter(
+  messages: BaseMessage[],
+  options: {
+    enableCompression?: boolean;
+    maxHistoryLength?: number;
+    autoTerminateLoops?: boolean;
+  } = {}
+): {
+  messages: BaseMessage[];
+  loopDetected: boolean;
+  shouldTerminate: boolean;
+  stats: {
+    original: number;
+    filtered: number;
+    removed: number;
+  };
+} {
+  const {
+    enableCompression = true,
+    maxHistoryLength = 25, // 🔧 INCREASED from 25 to 30
+    autoTerminateLoops = true, // 🔧 CHANGED from true to false
+  } = options;
 
-const mergedState: GraphState = {
-  ...existingState.values,
-  step,
-  sandbox,
-  messages: [...cleanedMessages, new HumanMessage(userQuery)],
-  mainTaskExecuted: false,
-  hasWriteErrors: false,
+  const originalCount = messages.length;
+
+  // Step 1: Detect loops - but be more conservative
+  const loopInfo = detectRepetitiveLoop(messages);
+
+  if (loopInfo.hasLoop) {
+    console.log(
+      `🔄 Loop detected: "${loopInfo.pattern}" repeated ${loopInfo.count} times`
+    );
+  }
+
+  // 🔧 FIXED: Only terminate if we have a severe loop AND no recent progress
+  const hasRecentProgress = messages
+    .slice(-5)
+    .some(
+      (msg) =>
+        msg instanceof ToolMessage &&
+        typeof msg.content === "string" &&
+        (msg.content.includes("✅ Successfully wrote") ||
+          msg.content.includes("Command executed successfully") ||
+          msg.content.includes("=== END"))
+    );
+
+  const shouldActuallyTerminate =
+    loopInfo.shouldTerminate && !hasRecentProgress;
+
+  // Step 2: Apply less aggressive filtering
+  let filtered = filterRepetitiveMessagesAdvanced(messages, {
+    maxDuplicates: 3, // 🔧 LESS aggressive - allow 3 duplicates
+    recentWindowSize: 12, // 🔧 INCREASED window size
+    aggressiveMode: true, // 🔧 DISABLED aggressive mode
+  });
+
+  // Step 3: Compress if needed
+  if (enableCompression && filtered.length > maxHistoryLength) {
+    filtered = compressMessageHistory(filtered, maxHistoryLength);
+  }
+
+  // Step 4: Final system message cleanup
+  filtered = cleanupSystemMessages(filtered);
+
+  const finalCount = filtered.length;
+
+  return {
+    messages: filtered,
+    loopDetected: loopInfo.hasLoop,
+    shouldTerminate: autoTerminateLoops && shouldActuallyTerminate!,
+    stats: {
+      original: originalCount,
+      filtered: finalCount,
+      removed: originalCount - finalCount,
+    },
+  };
+}
+
+/**
+ * Clean up system messages to ensure only one primary system message exists
+ */
+function cleanupSystemMessages(messages: BaseMessage[]): BaseMessage[] {
+  let primarySystemMessage: SystemMessage | null = null;
+  const otherMessages: BaseMessage[] = [];
+
+  for (const message of messages) {
+    if (message instanceof SystemMessage) {
+      // Keep only the first comprehensive system message
+      if (
+        !primarySystemMessage &&
+        message.content
+          .toString()
+          .includes("You are a senior software engineer")
+      ) {
+        primarySystemMessage = message;
+      }
+      // Skip other system messages
+    } else {
+      otherMessages.push(message);
+    }
+  }
+
+  return primarySystemMessage
+    ? [primarySystemMessage, ...otherMessages]
+    : otherMessages;
+}
+
+// Legacy exports for backward compatibility
+export const filterMessages = (messages: BaseMessage[]): BaseMessage[] => {
+  const result = masterMessageFilter(messages, {
+    enableCompression: false,
+    autoTerminateLoops: true, // 🔧 DISABLED auto-termination
+  });
+  return result.messages;
 };
-*/
+
+export const filterAllRepetitiveMessages = (
+  messages: BaseMessage[],
+  windowSize: number = 5, // 🔧 INCREASED from 5 to 8
+  threshold: number = 3 // 🔧 INCREASED from 3 to 4
+): BaseMessage[] => {
+  return filterRepetitiveMessagesAdvanced(messages, {
+    maxDuplicates: threshold - 1,
+    recentWindowSize: windowSize,
+    aggressiveMode: false, // 🔧 DISABLED aggressive mode
+  });
+};
+
+export const detectRepetitivePattern = (
+  messages: BaseMessage[],
+  windowSize: number = 5, // 🔧 INCREASED from 5 to 8
+  threshold: number = 3 // 🔧 INCREASED from 3 to 5
+): boolean => {
+  const result = detectRepetitiveLoop(messages, threshold);
+  return result.hasLoop;
+};

@@ -24,7 +24,6 @@ export const GraphAnnotation = Annotation.Root({
     reducer: (left, right) => {
       if (!right) return left;
       if (!left) return right;
-
       // Deep merge network data
       const merged = {
         ...left,
@@ -69,3 +68,11 @@ export const GraphAnnotation = Annotation.Root({
 });
 
 export type GraphState = typeof GraphAnnotation.State;
+
+// Enhanced interface for better type safety
+export interface NetworkData {
+  files?: any[];
+  writtenFiles?: Record<string, string>;
+  lastReadFiles?: string | null;
+}
+
