@@ -105,9 +105,10 @@ export const AiAgent = inngest.createFunction(
 
         // 🚀 FIXED: Use less aggressive filtering settings
         const filterResult = masterMessageFilter(currentMessages, {
-          enableCompression: false, // 🔧 DISABLED compression for active sessions
-          maxHistoryLength: 35, // 🔧 INCREASED from 20 to 35
+          enableCompression: true, // 🔧 DISABLED compression for active sessions
+          maxHistoryLength: 20, // 🔧 INCREASED from 20 to 35
           autoTerminateLoops: false, // 🔧 DISABLED auto-termination
+          aggressiveToolFiltering: true
         });
 
         console.log(`✨ Filter results:`, filterResult.stats);

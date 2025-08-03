@@ -163,8 +163,6 @@ const ReadFiles = makeToolClass(
     logStep(id, `Reading files: ${files.join(", ")}`);
 
     try {
-
-
       const contents = async () => {
         const results = [];
         for (const file of files) {
@@ -175,7 +173,6 @@ const ReadFiles = makeToolClass(
       };
 
       const results = await contents();
-
 
       const fileContents = await results.map((content: any, i: any) => ({
         path: files[i],
@@ -409,7 +406,10 @@ const callTools = async (state: GraphState): Promise<Partial<GraphState>> => {
   return finalUpdate;
 };
 
+
+
 // Also debug the LLM call to see if it receives the tool messages
+// Updated callLlm function with enhanced tool message filtering
 export const callLlm =
   (llm: any, llmWithTools: any) =>
   async (state: GraphState): Promise<Partial<GraphState>> => {
@@ -428,22 +428,28 @@ export const callLlm =
       console.log("❌ NO FILE CONTENTS IN STATE");
     }
 
-    // Apply message filtering
+    // Apply enhanced message filtering with aggressive tool message filtering
     const filterResult = masterMessageFilter(state.messages, {
-      enableCompression: false,
+      enableCompression: true,
+      maxHistoryLength: 25,
       autoTerminateLoops: false,
+      aggressiveToolFiltering: true, // 🚀 NEW: Aggressive tool message filtering
     });
 
-    console.log("🔍 MESSAGES AFTER FILTERING:", filterResult.messages.length);
+    console.log("🔍 ENHANCED FILTERING RESULTS:");
+    console.log(`- Original messages: ${filterResult.stats.original}`);
+    console.log(`- Filtered messages: ${filterResult.stats.filtered}`);
+    console.log(`- Total removed: ${filterResult.stats.removed}`);
+    console.log(
+      `- Tool messages removed: ${filterResult.stats.toolMessagesRemoved}`
+    );
+
     filterResult.messages.forEach((msg, idx) => {
-      console.log(
-        `${idx}: ${msg.constructor.name} - ${msg.content
-          ?.toString()
-          .slice(0, 100)}...`
-      );
+      const preview = msg.content?.toString().slice(0, 100) || "";
+      console.log(`${idx}: ${msg.constructor.name} - ${preview}...`);
     });
 
-    // Handle loop detection logic...
+    // Enhanced loop detection with tool message awareness
     if (filterResult.loopDetected && filterResult.shouldTerminate) {
       const hasCompletedWork = state.messages.some(
         (msg) =>
@@ -479,22 +485,28 @@ export const callLlm =
       };
     }
 
-    // Check for task completion...
+    // Enhanced completion detection with tool message analysis
     const hasCompletedFiles =
       Object.keys(state.network?.data?.writtenFiles || {}).length > 0;
+
     if (hasCompletedFiles) {
-      const recentMessages = currentMessages.slice(-3);
-      const hasCompletionSignals = recentMessages.some(
-        (msg) =>
-          msg.content
-            ?.toString()
-            .includes("already exist with identical content") ||
-          msg.content?.toString().includes("Task completed") ||
-          msg.content?.toString().includes("essentially complete")
-      );
+      const recentMessages = currentMessages.slice(-5);
+      const hasCompletionSignals = recentMessages.some((msg) => {
+        if (!(msg instanceof ToolMessage)) return false;
+        const content = msg.content?.toString() || "";
+
+        return (
+          content.includes("already exist with identical content") ||
+          content.includes("Task completed") ||
+          content.includes("essentially complete") ||
+          content.includes("TASK COMPLETION DETECTED")
+        );
+      });
 
       if (hasCompletionSignals) {
-        console.log("✅ Completion signals detected - generating summary");
+        console.log(
+          "✅ Enhanced completion signals detected - generating summary"
+        );
         const response = await promptFinalSummary(currentMessages, llm);
         return {
           messages: [response],
@@ -504,7 +516,7 @@ export const callLlm =
       }
     }
 
-    // 🚀 ENHANCED: Create system message with file contents
+    // 🚀 ENHANCED: Create system message with file contents and filtering stats
     const stateSummary = JSON.stringify(
       {
         files: state.network?.data?.files || [],
@@ -513,6 +525,7 @@ export const callLlm =
         mainTaskExecuted: state.mainTaskExecuted,
         hasWriteErrors: state.hasWriteErrors,
         next: state.next,
+        filteringStats: filterResult.stats, // Include filtering statistics
       },
       null,
       2
@@ -531,12 +544,24 @@ export const callLlm =
       let contextContent = `System context:
 ${stateSummary}
 
+🚀 ENHANCED ANTI-REPETITION SYSTEM ACTIVE:
+- ${filterResult.stats.toolMessagesRemoved} redundant tool messages were filtered out
+- Loop detection is active (detected: ${filterResult.loopDetected})
+
 IMPORTANT: Before creating or updating files, check if they already exist with the same content in writtenFiles. If they do, the task is likely already complete and you should provide the final <task_summary>.
 
-TOOL USAGE CORRECTIONS:
+CRITICAL TOOL USAGE RULES:
+- DO NOT repeat tool calls if you see completion signals in recent messages
+- If you see "✅ Successfully wrote" or "Task completed" in recent tool responses, provide <task_summary> immediately
+- Check conversation history before using readFiles - file content may already be available
 - For readFiles tool, use parameter "files" (array of strings), NOT "paths"
 - For createOrUpdateFiles tool, ensure "files" is a proper array, not a stringified JSON
-- Always check tool responses for completion signals before making more tool calls`;
+- Always check tool responses for completion signals before making more tool calls
+
+TOOL REPETITION PREVENTION:
+- If the same file operation was successful recently, do not repeat it
+- If file content was already read in this conversation, reference existing content instead of re-reading
+- Look for completion indicators in tool responses before proceeding`;
 
       // 🚀 CRITICAL: Add file contents to context
       if (fileContents) {
@@ -551,7 +576,7 @@ TOOL USAGE CORRECTIONS:
       ? [contextMessage, ...userMessages]
       : userMessages;
 
-    console.log("\n🔍 FINAL MESSAGES SENT TO LLM:");
+    console.log("\n🔍 FINAL MESSAGES SENT TO LLM (after enhanced filtering):");
     fullMessages.forEach((msg, idx) => {
       console.log(
         `${idx}: ${msg.constructor.name} - Length: ${
@@ -574,6 +599,7 @@ TOOL USAGE CORRECTIONS:
 
     logState("LLM NODE (after)", state);
 
+    // 🚀 ENHANCED: Include filtering stats in return
     return {
       messages:
         filterResult.stats.removed > 0
@@ -589,6 +615,7 @@ TOOL USAGE CORRECTIONS:
       },
     };
   };
+
 
 //  LLM Node with better message filtering and completion detection
 const promptFinalSummary = async (messages: any[], llm: any) => {
